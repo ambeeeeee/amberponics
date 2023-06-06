@@ -13,14 +13,16 @@ use test_app as _; // global logger + panicking-behavior + memory layout
 )]
 mod app {
 
+    use defmt::debug;
     use stm32h7xx_hal::device::I2C1;
     use stm32h7xx_hal::i2c::I2c;
     use stm32h7xx_hal::pac::Peripherals;
 
-    use stm32h7xx_hal::spi::Event;
-
-    use stm32h7xx_hal::{prelude::*, spi};
-    use test_app::sensors::{HumiditySensor, OxygenSensor, Sensors};
+    use stm32h7xx_hal::prelude::*;
+    use test_app::sensors::{
+        AtlasScientificSensors, HumiditySensor, OxygenSensor, PendingAction, PendingOperation,
+    };
+    use test_app::AtlasCommand;
 
     // =================================================================================
     //                             Shared Resources
@@ -28,8 +30,7 @@ mod app {
     #[shared]
     struct Shared {
         i2c_atlas: I2c<I2C1>,
-        atlas_command: (),
-        atlas_response: (),
+        atlas_response: Option<()>,
     }
 
     // =================================================================================
@@ -37,7 +38,7 @@ mod app {
     // =================================================================================
     #[local]
     struct Local {
-        atlas_sensors: Sensors<2>,
+        atlas_sensors: AtlasScientificSensors<2>,
     }
 
     // =================================================================================
@@ -71,7 +72,7 @@ mod app {
             .i2c((scl, sda), 100.kHz(), ccdr.peripheral.I2C1, &ccdr.clocks);
 
         // Create atlas scientific sensors processor.
-        let atlas_sensors = Sensors {
+        let atlas_sensors = AtlasScientificSensors {
             sensors: [cx.local.humidity_sensor as _, cx.local.oxygen_sensor as _],
             current_operation: None,
         };
@@ -87,8 +88,7 @@ mod app {
             Shared {
                 // Initialization of shared resources go here
                 i2c_atlas: i2c,
-                atlas_command: (),
-                atlas_response: (),
+                atlas_response: None,
             },
             Local { atlas_sensors },
         )
@@ -97,19 +97,188 @@ mod app {
     // =================================================================================
     //                        Atlas Scientific Sensor Operations
     // =================================================================================
-    
+
     /// Processes current Atlas Scientific sensor operations.
-    #[task(local = [atlas_sensors])]
-    async fn atlas_sensors(_cx: atlas_sensors::Context) {}
+    #[task(local = [atlas_sensors], shared = [atlas_response])]
+    async fn atlas_sensors(mut cx: atlas_sensors::Context) {
+        let sensors = cx.local.atlas_sensors;
+
+        if sensors.current_operation.is_none() {
+            // Determine the current operation
+            let mut soonest_deadline = None;
+            let mut soonest = None;
+            let mut soonest_index = None;
+
+            for (index, sensor) in sensors.sensors.iter().enumerate() {
+                match sensor.pending_action() {
+                    operation @ PendingAction::Startup { .. } => {
+                        // We'll deal with startup commands immediately
+                        sensors.current_operation = Some(PendingOperation {
+                            sensor: index,
+                            operation: *operation,
+                        });
+
+                        break;
+                    }
+                    PendingAction::Sample { deadline } => {
+                        if soonest_deadline.is_none() {
+                            soonest_deadline = Some(*deadline);
+                            soonest = Some(sensor);
+                            soonest_index = Some(index);
+                        } else if soonest_deadline.unwrap() >= *deadline {
+                            soonest_deadline = Some(*deadline);
+                            soonest = Some(sensor);
+                            soonest_index = Some(index);
+                        }
+                    }
+                    PendingAction::Receive { deadline } => {
+                        if soonest_deadline.is_none() {
+                            soonest_deadline = Some(*deadline);
+                            soonest = Some(sensor);
+                            soonest_index = Some(index);
+                        } else if soonest_deadline.unwrap() >= *deadline {
+                            soonest_deadline = Some(*deadline);
+                            soonest = Some(sensor);
+                            soonest_index = Some(index);
+                        }
+                    }
+                }
+            }
+
+            // If soonest_deadline filtering is needed to set the current operation, we set it now.
+            if sensors.current_operation.is_none() {
+                if let (Some(soonest), Some(soonest_index)) = (soonest, soonest_index) {
+                    sensors.current_operation = Some(PendingOperation {
+                        sensor: soonest_index,
+                        operation: *soonest.pending_action(),
+                    })
+                }
+            }
+        }
+
+        let next_operation;
+
+        if let Some(mut current_operation) = sensors.current_operation.take() {
+            let sensor = sensors.sensors.get(current_operation.sensor).unwrap();
+
+            let address = sensor.address();
+
+            let next_action;
+
+            match current_operation.operation {
+                PendingAction::Startup { command_index } => {
+                    if sensor.setup_commands().len() > command_index {
+                        let send_command = sensor.setup_commands()[command_index];
+
+                        let mut command_buff = [0u8; 64];
+                        command_buff[..send_command.len()].copy_from_slice(send_command);
+
+                        send_atlas_command::spawn(AtlasCommand {
+                            address: address as usize,
+                            command: command_buff,
+                            len: send_command.len(),
+                        })
+                        .unwrap();
+
+                        if sensor.setup_commands().len() > command_index + 1 {
+                            next_action = Some(PendingAction::Startup {
+                                command_index: command_index + 1,
+                            })
+                        } else {
+                            next_action = None
+                        }
+                    } else {
+                        next_action = None
+                    }
+                }
+                PendingAction::Sample { deadline } => {
+                    let send_command = sensor.sample_command();
+
+                    let mut command_buff = [0u8; 64];
+                    command_buff[..send_command.len()].copy_from_slice(send_command);
+
+                    send_atlas_command::spawn(AtlasCommand {
+                        address: address as usize,
+                        command: command_buff,
+                        len: send_command.len(),
+                    })
+                    .unwrap();
+
+                    next_action = Some(PendingAction::Receive {
+                        deadline: deadline + 1,
+                    })
+                }
+                PendingAction::Receive { deadline: _ } => {
+                    handle_atlas_response::spawn(address as _).unwrap();
+
+                    loop {
+                        // Wait for response
+                        if let Some(response) =
+                            cx.shared.atlas_response.lock(|response| response.take())
+                        {
+                            break response;
+                        }
+                    }
+
+                    // Do thing with response
+
+                    next_action = None
+                }
+            }
+
+            if let Some(action) = next_action {
+                current_operation.operation = action;
+                next_operation = Some(current_operation);
+            } else {
+                next_operation = None;
+            }
+        } else {
+            next_operation = None;
+        }
+
+        if let Some(operation) = next_operation {
+            sensors.current_operation = Some(operation);
+        }
+    }
 
     /// Spawn to send command to Atlas Scientific sensor.
-    #[task(shared = [&atlas_command, i2c_atlas], priority = 1)]
-    async fn send_atlas_command(_cx: send_atlas_command::Context) {}
+    #[task(shared = [i2c_atlas], priority = 1)]
+    async fn send_atlas_command(mut cx: send_atlas_command::Context, command: AtlasCommand) {
+        cx.shared.i2c_atlas.lock(|i2c| {
+            debug!(
+                "[send_atlas_command] Writing i2c command to {}: {:?}",
+                command.address,
+                &command.command[..command.len]
+            );
+
+            i2c.write(
+                u8::try_from(command.address).unwrap(),
+                &command.command[..command.len],
+            )
+            .unwrap();
+        })
+    }
 
     /// Spawn to handle response from target Atlas Scientific sensor. The result is stored
     /// in the shared `atlas_response` value.
-    #[task(shared = [atlas_response], priority = 1)]
-    async fn handle_atlas_response(_cx: handle_atlas_response::Context) {}
+    #[task(shared = [atlas_response, i2c_atlas], priority = 1)]
+    async fn handle_atlas_response(mut cx: handle_atlas_response::Context, address: u8) {
+        let mut read_buffer: [u8; 64] = [0; 64];
+        let mut offset = 0;
+
+        cx.shared.i2c_atlas.lock(|i2c| {
+            defmt::trace!("[read_atlas_response] Reading i2c from {}.", address);
+
+            while i2c.read(address, &mut read_buffer[offset..]).is_ok() {
+                offset += 1;
+            }
+        });
+
+        debug!(
+            "[read_atlas_response] Read {} bytes from i2c for {}.",
+            offset, address
+        );
+    }
 
     // =================================================================================
     //                         XBEE Operation and Communication

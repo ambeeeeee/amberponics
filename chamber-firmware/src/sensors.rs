@@ -1,21 +1,23 @@
-pub struct Sensors<const SIZE: usize> {
+pub struct AtlasScientificSensors<const SIZE: usize> {
     pub sensors: [&'static mut dyn AtlasSensor; SIZE],
     pub current_operation: Option<PendingOperation>,
 }
 
 pub struct PendingOperation {
-    pub sensor: &'static dyn AtlasSensor,
+    pub sensor: usize,
     pub operation: PendingAction,
 }
 
+#[derive(Clone, Copy)]
 pub enum PendingAction {
-    Sample { deadline: () },
-    Receive { deadline: () },
+    Startup { command_index: usize },
+    Sample { deadline: u32 },
+    Receive { deadline: u32 },
 }
 
 impl Default for PendingAction {
     fn default() -> Self {
-        Self::Sample { deadline: () }
+        Self::Startup { command_index: 0 }
     }
 }
 
@@ -28,7 +30,7 @@ impl OxygenSensor {
     pub const fn new() -> Self {
         Self {
             last_reading: 0.0,
-            action: PendingAction::Sample { deadline: () },
+            action: PendingAction::Startup { command_index: 0 },
         }
     }
 }
@@ -45,6 +47,10 @@ impl AtlasSensor for OxygenSensor {
     fn handle_response(&mut self, _response: &[u8]) {
         todo!()
     }
+
+    fn pending_action(&self) -> &PendingAction {
+        &self.action
+    }
 }
 
 #[derive(Default)]
@@ -59,7 +65,7 @@ impl HumiditySensor {
         Self {
             last_humidity: 0.0,
             last_temperature: 0.0,
-            action: PendingAction::Sample { deadline: () },
+            action: PendingAction::Startup { command_index: 0 },
         }
     }
 }
@@ -83,16 +89,10 @@ impl AtlasSensor for HumiditySensor {
     fn handle_response(&mut self, _response: &[u8]) {
         todo!()
     }
-}
 
-pub struct GrowUnitFloat1 {
-    pub last_reading: bool,
-    pub action: PendingAction,
-}
-
-pub struct GrowUnitFloat2 {
-    pub last_reading: bool,
-    pub action: PendingAction,
+    fn pending_action(&self) -> &PendingAction {
+        &self.action
+    }
 }
 
 pub trait AtlasSensor {
@@ -105,6 +105,9 @@ pub trait AtlasSensor {
     /// passed to the [`AtlasSensor::handle_response`] implementation
     /// for parsing.
     fn sample_command(&self) -> &'static [u8];
+
+    /// Returns the current pending action.
+    fn pending_action(&self) -> &PendingAction;
 
     /// Returns any command strings needed to set up the device.
     ///
