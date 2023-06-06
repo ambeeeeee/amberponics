@@ -35,10 +35,3 @@ pub fn exit() -> ! {
         cortex_m::asm::bkpt();
     }
 }
-
-#[derive(Debug)]
-pub struct AtlasCommand {
-    pub address: usize,
-    pub command: [u8; 64],
-    pub len: usize,
-}

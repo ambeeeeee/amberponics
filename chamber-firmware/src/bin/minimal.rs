@@ -2,7 +2,7 @@
 #![no_std]
 #![feature(type_alias_impl_trait)]
 
-use test_app as _; // global logger + panicking-behavior + memory layout
+use chamber_firmware as _; // global logger + panicking-behavior + memory layout
 
 // TODO(7) Configure the `rtic::app` macro
 #[rtic::app(
@@ -14,15 +14,20 @@ use test_app as _; // global logger + panicking-behavior + memory layout
 mod app {
 
     use defmt::debug;
+    use heapless::Vec;
+    use rtic_monotonics::systick::fugit::Duration;
+    use rtic_monotonics::systick::Systick;
     use stm32h7xx_hal::device::I2C1;
     use stm32h7xx_hal::i2c::I2c;
     use stm32h7xx_hal::pac::Peripherals;
 
+    use rtic_monotonics::Monotonic;
     use stm32h7xx_hal::prelude::*;
-    use test_app::sensors::{
-        AtlasScientificSensors, HumiditySensor, OxygenSensor, PendingAction, PendingOperation,
+
+    use chamber_firmware::atlas::{
+        AtlasCommand, HumiditySensor, OxygenSensor, PendingAction, PendingOperation, ResponseCode,
     };
-    use test_app::AtlasCommand;
+    use chamber_firmware::sensors::AtlasScientificSensors;
 
     // =================================================================================
     //                             Shared Resources
@@ -30,7 +35,7 @@ mod app {
     #[shared]
     struct Shared {
         i2c_atlas: I2c<I2C1>,
-        atlas_response: Option<()>,
+        atlas_response: Option<Vec<u8, 64>>,
     }
 
     // =================================================================================
@@ -78,11 +83,10 @@ mod app {
         };
 
         // TODO setup monotonic if used
-        // let sysclk = { /* clock setup + returning sysclk as an u32 */ };
-        // let token = rtic_monotonics::create_systick_token!();
-        // rtic_monotonics::systick::Systick::new(cx.core.SYST, sysclk, token);
+        let systick_token = rtic_monotonics::create_systick_token!();
+        Systick::start(cx.core.SYST, 12_000_000, systick_token);
 
-        // task1::spawn().ok();
+        atlas_sensors::spawn().unwrap();
 
         (
             Shared {
@@ -159,7 +163,7 @@ mod app {
         let next_operation;
 
         if let Some(mut current_operation) = sensors.current_operation.take() {
-            let sensor = sensors.sensors.get(current_operation.sensor).unwrap();
+            let sensor = sensors.sensors.get_mut(current_operation.sensor).unwrap();
 
             let address = sensor.address();
 
@@ -170,13 +174,17 @@ mod app {
                     if sensor.setup_commands().len() > command_index {
                         let send_command = sensor.setup_commands()[command_index];
 
-                        let mut command_buff = [0u8; 64];
+                        let mut command_buff = Vec::new();
                         command_buff[..send_command.len()].copy_from_slice(send_command);
 
+                        defmt::trace!(
+                            "[atlas_sensors] Startup command {} for sensor {} issuing.",
+                            send_command,
+                            address
+                        );
                         send_atlas_command::spawn(AtlasCommand {
                             address: address as usize,
                             command: command_buff,
-                            len: send_command.len(),
                         })
                         .unwrap();
 
@@ -185,6 +193,12 @@ mod app {
                                 command_index: command_index + 1,
                             })
                         } else {
+                            // We're done running startup commands, queue a sample
+                            *sensor.pending_action_mut() = PendingAction::Sample {
+                                deadline: Systick::now()
+                                    + Duration::<u32, 1, 1000>::from_ticks(5000),
+                            };
+
                             next_action = None
                         }
                     } else {
@@ -194,33 +208,61 @@ mod app {
                 PendingAction::Sample { deadline } => {
                     let send_command = sensor.sample_command();
 
-                    let mut command_buff = [0u8; 64];
+                    let mut command_buff = Vec::new();
                     command_buff[..send_command.len()].copy_from_slice(send_command);
 
+                    defmt::trace!(
+                        "[atlas_sensors] Sample command {} for sensor {} issuing.",
+                        send_command,
+                        address
+                    );
                     send_atlas_command::spawn(AtlasCommand {
                         address: address as usize,
                         command: command_buff,
-                        len: send_command.len(),
                     })
                     .unwrap();
 
                     next_action = Some(PendingAction::Receive {
-                        deadline: deadline + 1,
+                        deadline: deadline + Duration::<u32, 1, 1000>::from_ticks(1000u32),
                     })
                 }
                 PendingAction::Receive { deadline: _ } => {
+                    defmt::trace!("[atlas_sensors] Handling response for sensor {}.", address);
                     handle_atlas_response::spawn(address as _).unwrap();
 
-                    loop {
+                    let response = loop {
                         // Wait for response
                         if let Some(response) =
                             cx.shared.atlas_response.lock(|response| response.take())
                         {
                             break response;
                         }
+                    };
+
+                    let response_code = ResponseCode::try_from_probe_response(&response).unwrap();
+
+                    let split = response.split(|c| *c == '\r' as u8);
+
+                    for token in split {
+                        defmt::trace!("Read token {:?}", core::str::from_utf8(&token));
                     }
 
+                    let mut split = response.split(|c| *c == '\r' as u8);
+                    let token = split.next().unwrap();
+                    let token = core::str::from_utf8(&token).unwrap();
+
+                    let value: f64 = token.parse().unwrap();
+
+                    debug!(
+                        "Read value {} with status {} from sensor {}",
+                        value, response_code, address
+                    );
+
                     // Do thing with response
+
+                    *sensor.pending_action_mut() = PendingAction::Sample {
+                        deadline: Systick::now() + Duration::<u32, 1, 1000>::from_ticks(5000),
+                    };
 
                     next_action = None
                 }
@@ -229,6 +271,7 @@ mod app {
             if let Some(action) = next_action {
                 current_operation.operation = action;
                 next_operation = Some(current_operation);
+                *sensor.pending_action_mut() = action;
             } else {
                 next_operation = None;
             }
@@ -248,12 +291,12 @@ mod app {
             debug!(
                 "[send_atlas_command] Writing i2c command to {}: {:?}",
                 command.address,
-                &command.command[..command.len]
+                &command.command[..command.command.len()]
             );
 
             i2c.write(
                 u8::try_from(command.address).unwrap(),
-                &command.command[..command.len],
+                &command.command[..command.command.len()],
             )
             .unwrap();
         })
