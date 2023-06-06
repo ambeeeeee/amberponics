@@ -5,7 +5,7 @@
 | Growing Chamber Firmware   | 🚧 Early Development 🚧 | 🚫 None 🚫  |
 | Solution Analyzer Firmware | 🚧 Pre-Development 🚧   | 🚫 None 🚫  |
 
-"Development Status" refers to how stable the project is.
+"Development Status" refers to how stable the project is.  
 "Adaptability" refers to how easy it is to adapt the code beyond my exact use case.
 
 This repository contains projects and information that I use for my hydroponics setup.  
